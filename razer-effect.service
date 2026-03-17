@@ -1,0 +1,11 @@
+[Unit]
+Description=Razer per-key random RGB effect
+After=openrazer-daemon.service
+
+[Service]
+ExecStart=%h/.local/bin/razer-effect --loop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

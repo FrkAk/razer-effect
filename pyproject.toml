@@ -1,0 +1,57 @@
+[project]
+name = "razer-effect"
+version = "0.1.0"
+description = "Per-key random RGB effects with smooth fades for Razer keyboards via OpenRazer"
+requires-python = ">=3.10"
+license = "MIT"
+# Note: python3-openrazer and gi (GTK4) are system packages (not on PyPI).
+# They must be installed via your distro's package manager before using this tool.
+dependencies = ["numpy"]
+
+[dependency-groups]
+dev = ["ruff", "ty"]
+
+[project.scripts]
+razer-effect = "razer_effect.main:main"
+razer-effect-gui = "razer_effect.gui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/razer_effect"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "RUF", # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["razer_effect"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ty.environment]
+python-version = "3.10"
+extra-paths = [
+    "/usr/lib/python3.14/site-packages",
+    "/usr/lib64/python3.14/site-packages",
+]
+
+[tool.ty.rules]
+all = "error"

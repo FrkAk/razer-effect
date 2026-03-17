@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Razer Effect
+Comment=Configure per-key RGB effects for Razer keyboards
+Exec=razer-effect-gui
+Icon=razer-effect
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+Keywords=razer;rgb;keyboard;lighting;
