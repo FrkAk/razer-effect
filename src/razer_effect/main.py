@@ -1,216 +1,180 @@
-"""Per-key random RGB effects for Razer keyboards via OpenRazer."""
+"""CLI entry point for the razer-effect daemon."""
+
+from __future__ import annotations
 
 import argparse
 import signal
 import sys
 import time
+from typing import Any
 
 import numpy as np
-from openrazer.client import DeviceManager
 
 from razer_effect.config import CONFIG_PATH, ensure_config, load_config
+from razer_effect.device import find_device, write_frame
+from razer_effect.effects import EFFECTS
+from razer_effect.inotify import ConfigWatcher
 
 
-def _build_palette():
-    """Build a 360-color palette from full HSV wheel (S=1, V=1).
+def _instantiate_effect(cfg: dict[str, Any], rows: int, cols: int) -> Any:
+    """Create and set up an effect instance from config.
 
-    Returns:
-        numpy array of shape (360, 3) with float32 RGB values 0-255.
-    """
-    import colorsys
-
-    colors = np.empty((360, 3), dtype=np.float32)
-    for i in range(360):
-        r, g, b = colorsys.hsv_to_rgb(i / 360.0, 1.0, 1.0)
-        colors[i] = (r * 255, g * 255, b * 255)
-    return colors
-
-
-PALETTE = _build_palette()
-
-
-def find_device():
-    """Find the first Razer keyboard/laptop device with matrix support.
+    Args:
+        cfg: Current config dict.
+        rows: Matrix row count.
+        cols: Matrix column count.
 
     Returns:
-        The first device that supports advanced matrix lighting.
+        An initialized effect instance.
 
     Raises:
-        SystemExit: If no compatible device is found.
+        SystemExit: If the configured effect name is unknown.
     """
-    manager = DeviceManager()
-    manager.sync_effects = False
+    effect_name = cfg.get("effect", "key_shuffle")
+    effect_cls = EFFECTS.get(effect_name)
+    if effect_cls is None:
+        print(f"Unknown effect: {effect_name}", file=sys.stderr)
+        sys.exit(1)
 
-    for device in manager.devices:
-        if device.fx.advanced:
-            return device
-
-    print("No Razer device with per-key matrix support found.", file=sys.stderr)
-    sys.exit(1)
+    effect = effect_cls()
+    effect.setup(rows, cols, cfg)
+    return effect
 
 
-def write_frame(adv, colors):
-    """Write a (rows, cols, 3) float array to the device matrix and draw.
+def _handle_config_reload(
+    cfg: dict[str, Any],
+    device: Any,
+    effect: Any,
+    active_effect_name: str,
+    rows: int,
+    cols: int,
+) -> tuple[dict[str, Any], Any, str]:
+    """Reload config from disk and apply changes.
+
+    Handles pause/resume, brightness, effect switching, and parameter updates.
 
     Args:
-        adv: The device's advanced FX object.
-        colors: numpy array (rows, cols, 3) of RGB float values.
-    """
-    rgb = np.clip(colors, 0, 255).astype(np.uint8)
-    adv.matrix._matrix[0] = rgb[:, :, 0]
-    adv.matrix._matrix[1] = rgb[:, :, 1]
-    adv.matrix._matrix[2] = rgb[:, :, 2]
-    adv.draw()
-
-
-def random_colors(rows, cols):
-    """Generate a rows x cols grid of random palette colors as float32 array.
-
-    Args:
-        rows: Number of rows.
-        cols: Number of columns.
+        cfg: Previous config dict.
+        device: OpenRazer device.
+        effect: Current effect instance.
+        active_effect_name: Registry key of the currently running effect.
+        rows: Matrix row count.
+        cols: Matrix column count.
 
     Returns:
-        numpy array of shape (rows, cols, 3) with float32 RGB values.
+        Tuple of (new config, possibly new effect instance, active effect name).
     """
-    return PALETTE[np.random.randint(0, len(PALETTE), size=(rows, cols))]
+    cfg = load_config()
+
+    while not cfg.get("running", True):
+        time.sleep(1)
+        cfg = load_config()
+
+    brightness = cfg.get("brightness")
+    if brightness is not None:
+        device.brightness = max(0, min(100, int(brightness)))
+
+    new_effect_name = cfg.get("effect", "key_shuffle")
+    if new_effect_name != active_effect_name:
+        effect = _instantiate_effect(cfg, rows, cols)
+        active_effect_name = new_effect_name
+    else:
+        effect.configure(cfg)
+
+    return cfg, effect, active_effect_name
 
 
-def _config_mtime():
-    """Get config file modification time, or 0 if missing.
-
-    Returns:
-        Modification time as float, or 0.
-    """
-    try:
-        return CONFIG_PATH.stat().st_mtime
-    except OSError:
-        return 0
-
-
-def fade_loop(device, cfg):
-    """Continuously cycle per-key random colors with independent staggered fades.
-
-    Uses a single timer array: negative = holding, positive = fade progress (0-1).
-    Timer advance is branchless via signbit. Resets checked every few frames.
-    Hot-reloads config from disk when file changes.
+def _convert_frame(out: np.ndarray, rgb_buf: np.ndarray) -> None:
+    """Convert float32 frame to uint8 in-place with zero allocations.
 
     Args:
-        device: An OpenRazer device with advanced matrix support.
+        out: Float32 source buffer of shape (rows, cols, 3). Clamped in-place.
+        rgb_buf: Pre-allocated uint8 destination buffer of same shape.
+    """
+    np.clip(out, 0, 255, out=out)
+    np.copyto(rgb_buf, out, casting="unsafe")
+
+
+def run_loop(device: Any, cfg: dict[str, Any]) -> None:
+    """Main render loop with inotify-based config reload.
+
+    Args:
+        device: OpenRazer device with matrix support.
         cfg: Initial config dict.
     """
     adv = device.fx.advanced
     rows, cols = adv.rows, adv.cols
-    palette_len = len(PALETTE)
 
-    fade_duration = cfg["fade_duration"]
-    fade_fps = cfg["fade_fps"]
-    hold_min = cfg["hold_min"]
-    hold_max = cfg["hold_max"]
-    frame_delay = 1.0 / fade_fps
-    fade_step = frame_delay / fade_duration
-    step_diff = frame_delay - fade_step
+    active_effect_name = cfg.get("effect", "key_shuffle")
+    effect = _instantiate_effect(cfg, rows, cols)
+    out = np.empty((rows, cols, 3), dtype=np.float32)
+    rgb_buf = np.empty((rows, cols, 3), dtype=np.uint8)
 
-    current = random_colors(rows, cols)
-    target = random_colors(rows, cols)
-    timer = -np.random.uniform(0, hold_max, size=(rows, cols)).astype(np.float32)
+    fps = int(cfg.get("fps", 24))
+    frame_delay = 1.0 / fps
+    last_time = time.monotonic()
 
-    t_3d = np.empty((rows, cols, 1), dtype=np.float32)
-    display = np.empty((rows, cols, 3), dtype=np.float32)
-    step_arr = np.empty((rows, cols), dtype=np.float32)
+    watcher = ConfigWatcher(CONFIG_PATH)
 
-    write_frame(adv, current)
-
-    reset_interval = max(1, fade_fps // 4)
-    frame_count = 0
-    config_check_frames = fade_fps
-    config_frame_count = 0
-    last_mtime = _config_mtime()
+    _convert_frame(effect._current.copy(), rgb_buf)
+    write_frame(adv, rgb_buf)
 
     while True:
-        # Config hot-reload check (~1/second)
-        config_frame_count = (config_frame_count + 1) % config_check_frames
-        if config_frame_count == 0:
-            mtime = _config_mtime()
-            if mtime != last_mtime:
-                last_mtime = mtime
-                cfg = load_config()
+        if watcher.has_changed():
+            cfg, effect, active_effect_name = _handle_config_reload(
+                cfg, device, effect, active_effect_name, rows, cols
+            )
+            fps = int(cfg.get("fps", 24))
+            frame_delay = 1.0 / fps
 
-                # Pause loop if running=false
-                while not cfg.get("running", True):
-                    time.sleep(1)
-                    new_mt = _config_mtime()
-                    if new_mt != last_mtime:
-                        last_mtime = new_mt
-                        cfg = load_config()
+        now = time.monotonic()
+        dt = now - last_time
+        last_time = now
 
-                # Apply changed values
-                if cfg["brightness"] is not None:
-                    device.brightness = max(0, min(100, cfg["brightness"]))
+        effect.render(dt, out)
+        _convert_frame(out, rgb_buf)
+        write_frame(adv, rgb_buf)
 
-                fade_duration = cfg["fade_duration"]
-                fade_fps = cfg["fade_fps"]
-                hold_min = cfg["hold_min"]
-                hold_max = cfg["hold_max"]
-                frame_delay = 1.0 / fade_fps
-                fade_step = frame_delay / fade_duration
-                step_diff = frame_delay - fade_step
-                reset_interval = max(1, fade_fps // 4)
-                config_check_frames = fade_fps
-
-        start = time.monotonic()
-
-        # Branchless timer advance
-        np.signbit(timer, out=step_arr)
-        timer += step_arr * step_diff + fade_step
-
-        # Check for completed fades every few frames
-        frame_count = (frame_count + 1) % reset_interval
-        if frame_count == 0:
-            reset_mask = timer >= 1.0
-            if reset_mask.any():
-                current[reset_mask] = target[reset_mask]
-                n = int(reset_mask.sum())
-                target[reset_mask] = PALETTE[
-                    np.random.randint(0, palette_len, size=n)
-                ]
-                timer[reset_mask] = -np.random.uniform(hold_min, hold_max, size=n)
-
-        # Lerp: clamp timer to 0-1 for blending
-        np.clip(timer, 0.0, 1.0, out=t_3d[:, :, 0])
-        np.subtract(target, current, out=display)
-        display *= t_3d
-        display += current
-        write_frame(adv, display)
-
-        elapsed = time.monotonic() - start
+        elapsed = time.monotonic() - now
         sleep_time = frame_delay - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
 
 
-def main():
+def main() -> None:
     """CLI entry point for razer-effect."""
-    parser = argparse.ArgumentParser(description="Per-key random RGB for Razer keyboards")
-    parser.add_argument("--loop", action="store_true", help="continuously randomize with smooth fades")
+    parser = argparse.ArgumentParser(
+        description="Per-key random RGB for Razer keyboards"
+    )
+    parser.add_argument(
+        "--loop", action="store_true", help="continuously run the effect"
+    )
     args = parser.parse_args()
 
     cfg = ensure_config()
-
     device = find_device()
     adv = device.fx.advanced
     print(f"Found: {device.name} ({adv.rows}x{adv.cols} matrix)")
 
-    if cfg["brightness"] is not None:
-        device.brightness = max(0, min(100, cfg["brightness"]))
-        print(f"Brightness set to {cfg['brightness']}%")
+    brightness = cfg.get("brightness")
+    if brightness is not None:
+        device.brightness = max(0, min(100, int(brightness)))
+        print(f"Brightness set to {brightness}%")
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     if args.loop:
-        print(f"Looping: {cfg['fade_duration']}s fade @ {cfg['fade_fps']}fps (Ctrl+C to stop)")
-        fade_loop(device, cfg)
+        fps = cfg.get("fps", 24)
+        effect_name = cfg.get("effect", "key_shuffle")
+        print(f"Looping: {effect_name} @ {fps}fps (Ctrl+C to stop)")
+        run_loop(device, cfg)
     else:
+        from razer_effect.effects.key_shuffle import KeyShuffle
+
         rows, cols = adv.rows, adv.cols
-        write_frame(adv, random_colors(rows, cols))
+        effect = KeyShuffle()
+        effect.setup(rows, cols, cfg)
+        rgb_buf = np.empty((rows, cols, 3), dtype=np.uint8)
+        _convert_frame(effect._current.copy(), rgb_buf)
+        write_frame(adv, rgb_buf)
         print("Random colors applied.")
