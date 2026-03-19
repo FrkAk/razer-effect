@@ -8,6 +8,8 @@ Works on any Razer device with per-key RGB matrix support via [OpenRazer](https:
 
 | Effect | Description |
 |---|---|
+| Static Color | Uniform solid color across all keys with color wheel picker (HSV) |
+| Wave | Rainbow hue wave sweeping across the keyboard |
 | Key Shuffle | Each key independently cycles through random colors with smooth fade transitions |
 
 ## Prerequisites

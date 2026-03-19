@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import select
 import struct
 from typing import TYPE_CHECKING
 
@@ -83,6 +84,17 @@ class ConfigWatcher:
                 changed = True
 
         return changed
+
+    def wait(self) -> None:
+        """Block until the watched config file is modified.
+
+        Uses select() to sleep on the inotify fd with zero CPU usage.
+        Drains all events after waking, only returns when the target file changed.
+        """
+        while True:
+            select.select([self._fd], [], [])
+            if self.has_changed():
+                return
 
     def close(self) -> None:
         """Close the inotify file descriptor and release resources."""

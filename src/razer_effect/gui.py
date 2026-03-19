@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import colorsys
 import subprocess
 import sys
 from typing import Any
@@ -11,7 +12,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gtk  # noqa: E402  # ty: ignore[unresolved-import]
+from gi.repository import Adw, Gdk, Gtk  # noqa: E402  # ty: ignore[unresolved-import]
 
 from razer_effect.config import ensure_config, save_config  # noqa: E402
 from razer_effect.effects import EFFECTS  # noqa: E402
@@ -33,6 +34,8 @@ class RazerEffectWindow(Adw.ApplicationWindow):
         self._saving = False
         self._cfg = ensure_config()
         self._param_widgets: dict[str, Adw.SpinRow] = {}
+        self._color_button: Gtk.ColorDialogButton | None = None
+        self._color_row: Adw.ActionRow | None = None
         self._effect_names = list(EFFECTS.keys())
 
         content = Adw.ToolbarView()
@@ -113,6 +116,11 @@ class RazerEffectWindow(Adw.ApplicationWindow):
             self._params_group.remove(widget)
         self._param_widgets.clear()
 
+        if self._color_row is not None:
+            self._params_group.remove(self._color_row)
+            self._color_row = None
+            self._color_button = None
+
         effect_cls = EFFECTS.get(effect_name)
         if effect_cls is None:
             return
@@ -130,6 +138,67 @@ class RazerEffectWindow(Adw.ApplicationWindow):
                 value,
             )
             self._param_widgets[name] = row
+
+        if "hue" in effect_cls.PARAMS:
+            self._build_color_button()
+
+    def _build_color_button(self) -> None:
+        """Add a color dialog button synced with H/S/V spin rows."""
+        h = float(self._cfg.get("hue", 0.0)) / 360.0
+        s = float(self._cfg.get("saturation", 100.0)) / 100.0
+        v = float(self._cfg.get("value", 100.0)) / 100.0
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        rgba = Gdk.RGBA()
+        rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+
+        dialog = Gtk.ColorDialog()
+        self._color_button = Gtk.ColorDialogButton(dialog=dialog, rgba=rgba)
+        self._color_button.connect("notify::rgba", self._on_color_picked)
+
+        self._color_row = Adw.ActionRow(title="Color", subtitle="Pick from color wheel")
+        self._color_row.add_suffix(self._color_button)
+        self._params_group.add(self._color_row)
+
+    def _on_color_picked(self, button: Gtk.ColorDialogButton, *_args: Any) -> None:
+        """Handle color picked from the dialog, update H/S/V spin rows.
+
+        Args:
+            button: The color dialog button.
+            *_args: GTK signal arguments, ignored.
+        """
+        if self._saving:
+            return
+        rgba = button.get_rgba()
+        h, s, v = colorsys.rgb_to_hsv(rgba.red, rgba.green, rgba.blue)
+
+        hue_widget = self._param_widgets.get("hue")
+        sat_widget = self._param_widgets.get("saturation")
+        val_widget = self._param_widgets.get("value")
+        if hue_widget:
+            hue_widget.set_value(round(h * 360))
+        if sat_widget:
+            sat_widget.set_value(round(s * 100))
+        if val_widget:
+            val_widget.set_value(round(v * 100))
+
+    def _sync_color_button(self) -> None:
+        """Update color button preview from the current H/S/V spin row values."""
+        if self._color_button is None:
+            return
+        hue_widget = self._param_widgets.get("hue")
+        sat_widget = self._param_widgets.get("saturation")
+        val_widget = self._param_widgets.get("value")
+        if hue_widget is None:
+            return
+        h = hue_widget.get_value() / 360.0
+        s = sat_widget.get_value() / 100.0 if sat_widget else 1.0
+        v = val_widget.get_value() / 100.0 if val_widget else 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        rgba = Gdk.RGBA()
+        rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+        self._saving = True
+        self._color_button.set_rgba(rgba)
+        self._saving = False
 
     def _build_control(self, page: Adw.PreferencesPage) -> None:
         """Build the running toggle control group.
@@ -212,6 +281,7 @@ class RazerEffectWindow(Adw.ApplicationWindow):
                 self._cfg[name] = round(widget.get_value(), schema["digits"])
 
         save_config(self._cfg)
+        self._sync_color_button()
         self._saving = False
 
     def _check_service_status(self) -> None:

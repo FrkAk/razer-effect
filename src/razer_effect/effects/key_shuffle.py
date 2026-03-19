@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import colorsys
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -11,18 +10,7 @@ import numpy.typing as npt
 if TYPE_CHECKING:
     from razer_effect.effects import ParamSchema
 
-
-def _build_palette() -> npt.NDArray[np.float32]:
-    """Build a 360-color palette from full HSV wheel (S=1, V=1).
-
-    Returns:
-        Numpy array of shape (360, 3) with float32 RGB values 0-255.
-    """
-    colors = np.empty((360, 3), dtype=np.float32)
-    for i in range(360):
-        r, g, b = colorsys.hsv_to_rgb(i / 360.0, 1.0, 1.0)
-        colors[i] = (r * 255, g * 255, b * 255)
-    return colors
+from razer_effect.effects.palette import build_palette
 
 
 class KeyShuffle:
@@ -33,6 +21,7 @@ class KeyShuffle:
     """
 
     LABEL: ClassVar[str] = "Key Shuffle"
+    STATIC: ClassVar[bool] = False
     PARAMS: ClassVar[dict[str, ParamSchema]] = {
         "fade_duration": {
             "default": 2.0,
@@ -65,7 +54,7 @@ class KeyShuffle:
 
     def __init__(self) -> None:
         """Initialize with empty state before setup is called."""
-        self._palette = _build_palette()
+        self._palette = build_palette()
         self._rows = 0
         self._cols = 0
         self._fade_duration = 2.0

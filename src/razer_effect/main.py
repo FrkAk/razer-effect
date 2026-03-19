@@ -113,11 +113,9 @@ def run_loop(device: Any, cfg: dict[str, Any]) -> None:
     fps = int(cfg.get("fps", 24))
     frame_delay = 1.0 / fps
     last_time = time.monotonic()
+    needs_redraw = True
 
     watcher = ConfigWatcher(CONFIG_PATH)
-
-    _convert_frame(effect._current.copy(), rgb_buf)
-    write_frame(adv, rgb_buf)
 
     while True:
         if watcher.has_changed():
@@ -126,19 +124,36 @@ def run_loop(device: Any, cfg: dict[str, Any]) -> None:
             )
             fps = int(cfg.get("fps", 24))
             frame_delay = 1.0 / fps
+            last_time = time.monotonic()
+            needs_redraw = True
 
-        now = time.monotonic()
-        dt = now - last_time
-        last_time = now
+        if effect.STATIC:
+            if needs_redraw:
+                effect.render(0, out)
+                _convert_frame(out, rgb_buf)
+                write_frame(adv, rgb_buf)
+                needs_redraw = False
+            watcher.wait()
+            cfg, effect, active_effect_name = _handle_config_reload(
+                cfg, device, effect, active_effect_name, rows, cols
+            )
+            fps = int(cfg.get("fps", 24))
+            frame_delay = 1.0 / fps
+            last_time = time.monotonic()
+            needs_redraw = True
+        else:
+            now = time.monotonic()
+            dt = now - last_time
+            last_time = now
 
-        effect.render(dt, out)
-        _convert_frame(out, rgb_buf)
-        write_frame(adv, rgb_buf)
+            effect.render(dt, out)
+            _convert_frame(out, rgb_buf)
+            write_frame(adv, rgb_buf)
 
-        elapsed = time.monotonic() - now
-        sleep_time = frame_delay - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            elapsed = time.monotonic() - now
+            sleep_time = frame_delay - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
 
 def main() -> None:

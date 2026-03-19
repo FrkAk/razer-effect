@@ -26,6 +26,7 @@ class Effect(Protocol):
 
     LABEL: ClassVar[str]
     PARAMS: ClassVar[dict[str, ParamSchema]]
+    STATIC: ClassVar[bool]
 
     def setup(self, rows: int, cols: int, cfg: dict[str, Any]) -> None:
         """Allocate buffers and initialize state for given matrix dimensions.
@@ -62,9 +63,13 @@ def _register() -> dict[str, type[Effect]]:
         Mapping of effect names to their implementing classes.
     """
     from razer_effect.effects.key_shuffle import KeyShuffle
+    from razer_effect.effects.static_color import StaticColor
+    from razer_effect.effects.wave import Wave
 
     return {
         "key_shuffle": KeyShuffle,
+        "static_color": StaticColor,
+        "wave": Wave,
     }
 
 
