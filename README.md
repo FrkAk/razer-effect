@@ -14,9 +14,21 @@ Works on any Razer device with per-key RGB matrix support via [OpenRazer](https:
 
 ## Prerequisites
 
-1. [OpenRazer](https://openrazer.github.io/) v3.0+ with `python3-openrazer`
-2. GTK4 + libadwaita (pre-installed on Fedora/GNOME)
-3. User in `plugdev` group
+### 1. Install OpenRazer
+
+Follow the instructions for your distro at [openrazer.github.io/#download](https://openrazer.github.io/#download).
+
+### 2. Add your user to the plugdev group
+
+```bash
+sudo gpasswd -a $USER plugdev
+```
+
+Log out and back in for the group change to take effect.
+
+### 3. GTK4 + libadwaita
+
+Pre-installed on Fedora/GNOME. On other distros, install `gtk4` and `libadwaita` via your package manager.
 
 ## Install
 
