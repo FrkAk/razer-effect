@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from razer_effect.compositor import LayerStack, blend, build_layer_stack
 from razer_effect.config import CONFIG_PATH, ensure_config, load_config
 from razer_effect.device import (
     DeviceHandle,
@@ -23,58 +24,76 @@ from razer_effect.device import (
 from razer_effect.effects import EFFECTS
 from razer_effect.inotify import ConfigWatcher
 
+LayerSignature = tuple[str, tuple[tuple[str, float, bool], ...]]
 
-def _instantiate_effect(cfg: dict[str, Any], rows: int, cols: int) -> Any:
-    """Create and set up an effect instance from config.
+
+def _active_profile(cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Resolve the active profile from a v2 config.
+
+    Args:
+        cfg: Validated v2 config dict.
+
+    Returns:
+        Tuple of (profile name, profile dict). Falls back to the first profile
+        when `active_profile` is missing.
+    """
+    name = cfg.get("active_profile", "default")
+    profiles = cfg.get("profiles", {})
+    if name not in profiles and profiles:
+        name = next(iter(profiles))
+    return name, profiles.get(name, {"layers": [], "effect_params": {}})
+
+
+def _layer_signature(cfg: dict[str, Any]) -> LayerSignature:
+    """Compute a structural signature for the active profile's layer stack.
 
     Args:
         cfg: Current config dict.
-        rows: Matrix row count.
-        cols: Matrix column count.
 
     Returns:
-        An initialized effect instance.
-
-    Raises:
-        SystemExit: If the configured effect name is unknown.
+        Tuple of (profile name, tuple of per-layer (effect, opacity, enabled))
+        suitable for equality comparison to detect structural reloads.
     """
-    effect_name = cfg.get("effect", "key_shuffle")
-    effect_cls = EFFECTS.get(effect_name)
-    if effect_cls is None:
-        print(f"Unknown effect: {effect_name}", file=sys.stderr)
-        sys.exit(1)
-
-    effect = effect_cls()
-    effect.setup(rows, cols, cfg)
-    return effect
-
-
-def _effect_allowed(effect: Any, handle: DeviceHandle) -> bool:
-    """Check whether an effect opted in to rendering on the given handle.
-
-    Args:
-        effect: An effect instance.
-        handle: The device handle under consideration.
-
-    Returns:
-        True when the effect's `DEVICE_CLASSES` is None (universal) or
-        explicitly includes the handle's `device_class`.
-    """
-    classes = getattr(effect, "DEVICE_CLASSES", None)
-    return classes is None or handle.device_class in classes
+    name, profile = _active_profile(cfg)
+    layers = profile.get("layers", [])
+    sig = tuple(
+        (
+            str(layer.get("effect", "")),
+            float(layer.get("opacity", 1.0)),
+            bool(layer.get("enabled", True)),
+        )
+        for layer in layers
+    )
+    return name, sig
 
 
-def _build_effects(cfg: dict[str, Any], handles: list[DeviceHandle]) -> dict[str, Any]:
-    """Instantiate one effect per handle for the current config.
+def _build_layer_stacks(
+    cfg: dict[str, Any], handles: list[DeviceHandle]
+) -> dict[str, LayerStack]:
+    """Construct one LayerStack per handle from the active profile.
 
     Args:
         cfg: Current config dict.
         handles: Per-device handles.
 
     Returns:
-        Mapping of handle id (`id(handle)` as string) to effect instance.
+        Mapping of `str(id(handle))` to its LayerStack.
     """
-    return {str(id(h)): _instantiate_effect(cfg, h.rows, h.cols) for h in handles}
+    _, profile = _active_profile(cfg)
+    return {str(id(h)): build_layer_stack(h, profile, EFFECTS) for h in handles}
+
+
+def _reconfigure_stacks(stacks: dict[str, LayerStack], profile: dict[str, Any]) -> None:
+    """Push updated effect params into every layer's effect.
+
+    Args:
+        stacks: Mapping of handle id to LayerStack.
+        profile: The active profile dict providing `effect_params`.
+    """
+    params = dict(profile.get("effect_params", {}))
+    for stack in stacks.values():
+        for layer in stack:
+            layer.effect.configure(params)
 
 
 def _apply_brightness(cfg: dict[str, Any], handles: list[DeviceHandle]) -> None:
@@ -95,23 +114,23 @@ def _apply_brightness(cfg: dict[str, Any], handles: list[DeviceHandle]) -> None:
 def _handle_config_reload(
     cfg: dict[str, Any],
     handles: list[DeviceHandle],
-    effects: dict[str, Any],
-    active_effect_name: str,
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+    stacks: dict[str, LayerStack],
+    signature: LayerSignature,
+) -> tuple[dict[str, Any], dict[str, LayerStack], LayerSignature]:
     """Reload config from disk and apply changes across all handles.
 
-    Handles pause/resume, brightness, effect switching, and parameter updates.
-    On effect-name change, every handle gets a fresh effect instance sized to
-    its own matrix; otherwise the existing instances are reconfigured in place.
+    Rebuilds every LayerStack when the layer-stack signature changes
+    (effect swap, opacity tweak, enabled toggle, profile switch). Otherwise
+    reconfigures each layer's effect in place with the updated params.
 
     Args:
         cfg: Previous config dict.
         handles: Per-device handles.
-        effects: Current handle id -> effect instance mapping.
-        active_effect_name: Registry key of the currently running effect.
+        stacks: Current handle id -> LayerStack mapping.
+        signature: Previous layer-stack signature.
 
     Returns:
-        Tuple of (new config, new effects mapping, active effect name).
+        Tuple of (new config, new stacks, new signature).
     """
     cfg = load_config()
 
@@ -121,15 +140,14 @@ def _handle_config_reload(
 
     _apply_brightness(cfg, handles)
 
-    new_effect_name = cfg.get("effect", "key_shuffle")
-    if new_effect_name != active_effect_name:
-        effects = _build_effects(cfg, handles)
-        active_effect_name = new_effect_name
+    new_signature = _layer_signature(cfg)
+    if new_signature != signature:
+        stacks = _build_layer_stacks(cfg, handles)
     else:
-        for effect in effects.values():
-            effect.configure(cfg)
+        _, profile = _active_profile(cfg)
+        _reconfigure_stacks(stacks, profile)
 
-    return cfg, effects, active_effect_name
+    return cfg, stacks, new_signature
 
 
 def _convert_frame(out: np.ndarray, rgb_buf: np.ndarray) -> None:
@@ -143,49 +161,81 @@ def _convert_frame(out: np.ndarray, rgb_buf: np.ndarray) -> None:
     np.copyto(rgb_buf, out, casting="unsafe")
 
 
-def _reconcile_after_rescan(
+def _reconcile_stacks_after_rescan(
     cfg: dict[str, Any],
     handles: list[DeviceHandle],
-    effects: dict[str, Any],
-) -> dict[str, Any]:
-    """Drop stale entries from `effects` and instantiate any new handles.
+    stacks: dict[str, LayerStack],
+) -> dict[str, LayerStack]:
+    """Drop stale entries from `stacks` and build new ones for new handles.
 
     Args:
         cfg: Current config dict.
         handles: Post-rescan handle list.
-        effects: Existing handle id -> effect mapping.
+        stacks: Existing handle id -> stack mapping.
 
     Returns:
-        A mapping that has one effect per live handle.
+        A mapping that has one LayerStack per live handle.
     """
+    _, profile = _active_profile(cfg)
     live_keys = {str(id(h)) for h in handles}
-    reconciled: dict[str, Any] = {k: v for k, v in effects.items() if k in live_keys}
+    reconciled: dict[str, LayerStack] = {
+        k: v for k, v in stacks.items() if k in live_keys
+    }
     for h in handles:
         key = str(id(h))
         if key not in reconciled:
-            reconciled[key] = _instantiate_effect(cfg, h.rows, h.cols)
+            reconciled[key] = build_layer_stack(h, profile, EFFECTS)
     return reconciled
 
 
 def _render_tick(
-    handles: list[DeviceHandle], effects: dict[str, Any], dt: float
+    handles: list[DeviceHandle],
+    stacks: dict[str, LayerStack],
+    dt: float,
 ) -> None:
-    """Render and write one frame on every handle whose effect opted in.
+    """Composite and write one frame on every handle with active layers.
 
-    Excluded handles keep their last-written `rgb_buf` contents untouched.
+    Handles whose stack produced no active contribution keep their last
+    `rgb_buf` contents on hardware.
 
     Args:
         handles: Per-device handles.
-        effects: Handle id -> effect instance mapping.
+        stacks: Handle id -> LayerStack mapping.
         dt: Seconds elapsed since the previous tick.
     """
     for h in handles:
-        effect = effects.get(str(id(h)))
-        if effect is None or not _effect_allowed(effect, h):
+        stack = stacks.get(str(id(h)))
+        if stack is None:
             continue
-        effect.render(dt, h.canvas)
+        drew = blend(h.canvas, stack, dt, h.device_class)
+        if not drew:
+            continue
         _convert_frame(h.canvas, h.rgb_buf)
         write_frame(h.adv, h.rgb_buf)
+
+
+def _all_static(handles: list[DeviceHandle], stacks: dict[str, LayerStack]) -> bool:
+    """Check whether every handle's stack is fully static.
+
+    Args:
+        handles: Per-device handles.
+        stacks: Handle id -> LayerStack mapping.
+
+    Returns:
+        True iff at least one handle has active layers and every active layer
+        across every handle is STATIC.
+    """
+    any_active = False
+    for h in handles:
+        stack = stacks.get(str(id(h)))
+        if stack is None:
+            continue
+        if stack.is_all_static(h.device_class):
+            any_active = True
+            continue
+        for _ in stack.active(h.device_class):
+            return False
+    return any_active
 
 
 def run_loop(handles: list[DeviceHandle], cfg: dict[str, Any]) -> None:
@@ -195,8 +245,8 @@ def run_loop(handles: list[DeviceHandle], cfg: dict[str, Any]) -> None:
         handles: Initial list of device handles.
         cfg: Initial config dict.
     """
-    active_effect_name = cfg.get("effect", "key_shuffle")
-    effects = _build_effects(cfg, handles)
+    stacks = _build_layer_stacks(cfg, handles)
+    signature = _layer_signature(cfg)
 
     fps = int(cfg.get("fps", 24))
     frame_delay = 1.0 / fps
@@ -208,29 +258,26 @@ def run_loop(handles: list[DeviceHandle], cfg: dict[str, Any]) -> None:
     while True:
         if consume_rescan_request():
             handles = rescan_devices(handles)
-            effects = _reconcile_after_rescan(cfg, handles, effects)
+            stacks = _reconcile_stacks_after_rescan(cfg, handles, stacks)
             _apply_brightness(cfg, handles)
             needs_redraw = True
 
         if watcher.has_changed():
-            cfg, effects, active_effect_name = _handle_config_reload(
-                cfg, handles, effects, active_effect_name
+            cfg, stacks, signature = _handle_config_reload(
+                cfg, handles, stacks, signature
             )
             fps = int(cfg.get("fps", 24))
             frame_delay = 1.0 / fps
             last_time = time.monotonic()
             needs_redraw = True
 
-        any_effect = next(iter(effects.values()), None)
-        is_static = bool(getattr(any_effect, "STATIC", False)) if any_effect else False
-
-        if is_static:
+        if _all_static(handles, stacks):
             if needs_redraw:
-                _render_tick(handles, effects, 0.0)
+                _render_tick(handles, stacks, 0.0)
                 needs_redraw = False
             watcher.wait()
-            cfg, effects, active_effect_name = _handle_config_reload(
-                cfg, handles, effects, active_effect_name
+            cfg, stacks, signature = _handle_config_reload(
+                cfg, handles, stacks, signature
             )
             fps = int(cfg.get("fps", 24))
             frame_delay = 1.0 / fps
@@ -241,7 +288,7 @@ def run_loop(handles: list[DeviceHandle], cfg: dict[str, Any]) -> None:
             dt = now - last_time
             last_time = now
 
-            _render_tick(handles, effects, dt)
+            _render_tick(handles, stacks, dt)
 
             elapsed = time.monotonic() - now
             sleep_time = frame_delay - elapsed
@@ -279,15 +326,24 @@ def main() -> None:
 
     if args.loop:
         fps = cfg.get("fps", 24)
-        effect_name = cfg.get("effect", "key_shuffle")
-        print(f"Looping: {effect_name} @ {fps}fps (Ctrl+C to stop)")
+        profile_name, profile = _active_profile(cfg)
+        layer_count = len(profile.get("layers", []))
+        print(
+            f"Looping: profile={profile_name!r} layers={layer_count} "
+            f"@ {fps}fps (Ctrl+C to stop)"
+        )
         run_loop(handles, cfg)
     else:
-        from razer_effect.effects.key_shuffle import KeyShuffle
-
+        _, profile = _active_profile(cfg)
+        params = dict(profile.get("effect_params", {}))
+        layers = profile.get("layers", [])
+        first_name = layers[0]["effect"] if layers else "key_shuffle"
+        effect_cls = EFFECTS.get(first_name) or EFFECTS["key_shuffle"]
         for h in handles:
-            effect = KeyShuffle()
-            effect.setup(h.rows, h.cols, cfg)
-            _convert_frame(effect._current.copy(), h.rgb_buf)
+            effect = effect_cls()
+            effect.setup(h.rows, h.cols, params)
+            scratch = np.empty((h.rows, h.cols, 3), dtype=np.float32)
+            effect.render(0.0, scratch)
+            _convert_frame(scratch, h.rgb_buf)
             write_frame(h.adv, h.rgb_buf)
         print("Random colors applied.")
