@@ -27,6 +27,7 @@ class Effect(Protocol):
     LABEL: ClassVar[str]
     PARAMS: ClassVar[dict[str, ParamSchema]]
     STATIC: ClassVar[bool]
+    DEVICE_CLASSES: ClassVar[frozenset[str] | None] = None
 
     def setup(self, rows: int, cols: int, cfg: dict[str, Any]) -> None:
         """Allocate buffers and initialize state for given matrix dimensions.
