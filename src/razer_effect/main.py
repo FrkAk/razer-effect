@@ -11,7 +11,15 @@ from typing import Any
 import numpy as np
 
 from razer_effect.config import CONFIG_PATH, ensure_config, load_config
-from razer_effect.device import find_device, write_frame
+from razer_effect.device import (
+    DeviceHandle,
+    consume_rescan_request,
+    find_device,
+    find_devices,
+    request_rescan,
+    rescan_devices,
+    write_frame,
+)
 from razer_effect.effects import EFFECTS
 from razer_effect.inotify import ConfigWatcher
 
@@ -41,28 +49,69 @@ def _instantiate_effect(cfg: dict[str, Any], rows: int, cols: int) -> Any:
     return effect
 
 
+def _effect_allowed(effect: Any, handle: DeviceHandle) -> bool:
+    """Check whether an effect opted in to rendering on the given handle.
+
+    Args:
+        effect: An effect instance.
+        handle: The device handle under consideration.
+
+    Returns:
+        True when the effect's `DEVICE_CLASSES` is None (universal) or
+        explicitly includes the handle's `device_class`.
+    """
+    classes = getattr(effect, "DEVICE_CLASSES", None)
+    return classes is None or handle.device_class in classes
+
+
+def _build_effects(cfg: dict[str, Any], handles: list[DeviceHandle]) -> dict[str, Any]:
+    """Instantiate one effect per handle for the current config.
+
+    Args:
+        cfg: Current config dict.
+        handles: Per-device handles.
+
+    Returns:
+        Mapping of handle id (`id(handle)` as string) to effect instance.
+    """
+    return {str(id(h)): _instantiate_effect(cfg, h.rows, h.cols) for h in handles}
+
+
+def _apply_brightness(cfg: dict[str, Any], handles: list[DeviceHandle]) -> None:
+    """Push the configured brightness to every handle's device.
+
+    Args:
+        cfg: Current config dict.
+        handles: Per-device handles to update.
+    """
+    brightness = cfg.get("brightness")
+    if brightness is None:
+        return
+    value = max(0, min(100, int(brightness)))
+    for h in handles:
+        h.device.brightness = value
+
+
 def _handle_config_reload(
     cfg: dict[str, Any],
-    device: Any,
-    effect: Any,
+    handles: list[DeviceHandle],
+    effects: dict[str, Any],
     active_effect_name: str,
-    rows: int,
-    cols: int,
-) -> tuple[dict[str, Any], Any, str]:
-    """Reload config from disk and apply changes.
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Reload config from disk and apply changes across all handles.
 
     Handles pause/resume, brightness, effect switching, and parameter updates.
+    On effect-name change, every handle gets a fresh effect instance sized to
+    its own matrix; otherwise the existing instances are reconfigured in place.
 
     Args:
         cfg: Previous config dict.
-        device: OpenRazer device.
-        effect: Current effect instance.
+        handles: Per-device handles.
+        effects: Current handle id -> effect instance mapping.
         active_effect_name: Registry key of the currently running effect.
-        rows: Matrix row count.
-        cols: Matrix column count.
 
     Returns:
-        Tuple of (new config, possibly new effect instance, active effect name).
+        Tuple of (new config, new effects mapping, active effect name).
     """
     cfg = load_config()
 
@@ -70,18 +119,17 @@ def _handle_config_reload(
         time.sleep(1)
         cfg = load_config()
 
-    brightness = cfg.get("brightness")
-    if brightness is not None:
-        device.brightness = max(0, min(100, int(brightness)))
+    _apply_brightness(cfg, handles)
 
     new_effect_name = cfg.get("effect", "key_shuffle")
     if new_effect_name != active_effect_name:
-        effect = _instantiate_effect(cfg, rows, cols)
+        effects = _build_effects(cfg, handles)
         active_effect_name = new_effect_name
     else:
-        effect.configure(cfg)
+        for effect in effects.values():
+            effect.configure(cfg)
 
-    return cfg, effect, active_effect_name
+    return cfg, effects, active_effect_name
 
 
 def _convert_frame(out: np.ndarray, rgb_buf: np.ndarray) -> None:
@@ -95,20 +143,60 @@ def _convert_frame(out: np.ndarray, rgb_buf: np.ndarray) -> None:
     np.copyto(rgb_buf, out, casting="unsafe")
 
 
-def run_loop(device: Any, cfg: dict[str, Any]) -> None:
-    """Main render loop with inotify-based config reload.
+def _reconcile_after_rescan(
+    cfg: dict[str, Any],
+    handles: list[DeviceHandle],
+    effects: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop stale entries from `effects` and instantiate any new handles.
 
     Args:
-        device: OpenRazer device with matrix support.
+        cfg: Current config dict.
+        handles: Post-rescan handle list.
+        effects: Existing handle id -> effect mapping.
+
+    Returns:
+        A mapping that has one effect per live handle.
+    """
+    live_keys = {str(id(h)) for h in handles}
+    reconciled: dict[str, Any] = {k: v for k, v in effects.items() if k in live_keys}
+    for h in handles:
+        key = str(id(h))
+        if key not in reconciled:
+            reconciled[key] = _instantiate_effect(cfg, h.rows, h.cols)
+    return reconciled
+
+
+def _render_tick(
+    handles: list[DeviceHandle], effects: dict[str, Any], dt: float
+) -> None:
+    """Render and write one frame on every handle whose effect opted in.
+
+    Excluded handles keep their last-written `rgb_buf` contents untouched.
+
+    Args:
+        handles: Per-device handles.
+        effects: Handle id -> effect instance mapping.
+        dt: Seconds elapsed since the previous tick.
+    """
+    for h in handles:
+        effect = effects.get(str(id(h)))
+        if effect is None or not _effect_allowed(effect, h):
+            continue
+        effect.render(dt, h.canvas)
+        _convert_frame(h.canvas, h.rgb_buf)
+        write_frame(h.adv, h.rgb_buf)
+
+
+def run_loop(handles: list[DeviceHandle], cfg: dict[str, Any]) -> None:
+    """Main render loop with inotify-based config reload and SIGHUP rescan.
+
+    Args:
+        handles: Initial list of device handles.
         cfg: Initial config dict.
     """
-    adv = device.fx.advanced
-    rows, cols = adv.rows, adv.cols
-
     active_effect_name = cfg.get("effect", "key_shuffle")
-    effect = _instantiate_effect(cfg, rows, cols)
-    out = np.empty((rows, cols, 3), dtype=np.float32)
-    rgb_buf = np.empty((rows, cols, 3), dtype=np.uint8)
+    effects = _build_effects(cfg, handles)
 
     fps = int(cfg.get("fps", 24))
     frame_delay = 1.0 / fps
@@ -118,24 +206,31 @@ def run_loop(device: Any, cfg: dict[str, Any]) -> None:
     watcher = ConfigWatcher(CONFIG_PATH)
 
     while True:
+        if consume_rescan_request():
+            handles = rescan_devices(handles)
+            effects = _reconcile_after_rescan(cfg, handles, effects)
+            _apply_brightness(cfg, handles)
+            needs_redraw = True
+
         if watcher.has_changed():
-            cfg, effect, active_effect_name = _handle_config_reload(
-                cfg, device, effect, active_effect_name, rows, cols
+            cfg, effects, active_effect_name = _handle_config_reload(
+                cfg, handles, effects, active_effect_name
             )
             fps = int(cfg.get("fps", 24))
             frame_delay = 1.0 / fps
             last_time = time.monotonic()
             needs_redraw = True
 
-        if effect.STATIC:
+        any_effect = next(iter(effects.values()), None)
+        is_static = bool(getattr(any_effect, "STATIC", False)) if any_effect else False
+
+        if is_static:
             if needs_redraw:
-                effect.render(0, out)
-                _convert_frame(out, rgb_buf)
-                write_frame(adv, rgb_buf)
+                _render_tick(handles, effects, 0.0)
                 needs_redraw = False
             watcher.wait()
-            cfg, effect, active_effect_name = _handle_config_reload(
-                cfg, device, effect, active_effect_name, rows, cols
+            cfg, effects, active_effect_name = _handle_config_reload(
+                cfg, handles, effects, active_effect_name
             )
             fps = int(cfg.get("fps", 24))
             frame_delay = 1.0 / fps
@@ -146,9 +241,7 @@ def run_loop(device: Any, cfg: dict[str, Any]) -> None:
             dt = now - last_time
             last_time = now
 
-            effect.render(dt, out)
-            _convert_frame(out, rgb_buf)
-            write_frame(adv, rgb_buf)
+            _render_tick(handles, effects, dt)
 
             elapsed = time.monotonic() - now
             sleep_time = frame_delay - elapsed
@@ -167,29 +260,34 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = ensure_config()
-    device = find_device()
-    adv = device.fx.advanced
-    print(f"Found: {device.name} ({adv.rows}x{adv.cols} matrix)")
 
+    handles = find_devices()
+    if not handles:
+        find_device()
+        return
+
+    for h in handles:
+        print(f"Found: {h.device.name} ({h.rows}x{h.cols} {h.device_class})")
+
+    _apply_brightness(cfg, handles)
     brightness = cfg.get("brightness")
     if brightness is not None:
-        device.brightness = max(0, min(100, int(brightness)))
         print(f"Brightness set to {brightness}%")
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: request_rescan())
 
     if args.loop:
         fps = cfg.get("fps", 24)
         effect_name = cfg.get("effect", "key_shuffle")
         print(f"Looping: {effect_name} @ {fps}fps (Ctrl+C to stop)")
-        run_loop(device, cfg)
+        run_loop(handles, cfg)
     else:
         from razer_effect.effects.key_shuffle import KeyShuffle
 
-        rows, cols = adv.rows, adv.cols
-        effect = KeyShuffle()
-        effect.setup(rows, cols, cfg)
-        rgb_buf = np.empty((rows, cols, 3), dtype=np.uint8)
-        _convert_frame(effect._current.copy(), rgb_buf)
-        write_frame(adv, rgb_buf)
+        for h in handles:
+            effect = KeyShuffle()
+            effect.setup(h.rows, h.cols, cfg)
+            _convert_frame(effect._current.copy(), h.rgb_buf)
+            write_frame(h.adv, h.rgb_buf)
         print("Random colors applied.")
