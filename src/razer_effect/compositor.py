@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from razer_effect.config import MAX_LAYERS
+from razer_effect.plugins import record_render_failure, write_status_file
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -32,10 +33,14 @@ class Layer:
         effect: An initialized effect instance (already `setup` on this slot).
         effect_name: Registry key of the effect; used for reload diffing.
         opacity: Alpha in [0.0, 1.0]; clamped at construction.
-        enabled: When False the layer is skipped during blend.
+        enabled: User-set config flag; when False the layer is skipped during
+            blend.
         scratch: Pre-allocated (rows, cols, 3) float32 buffer the effect
             renders into. Owned by the layer for the lifetime of the stack so
             blend operates with zero per-tick allocations.
+        disabled: Runtime auto-disable flag set by `blend` after a plugin's
+            `render` raises `FAILURE_THRESHOLD` consecutive times. Distinct
+            from `enabled` so the GUI can tell user-off from daemon-off.
     """
 
     effect: Any
@@ -43,6 +48,7 @@ class Layer:
     opacity: float
     enabled: bool
     scratch: npt.NDArray[np.float32] = field(repr=False)
+    disabled: bool = False
 
     def __post_init__(self) -> None:
         """Clamp opacity into [0.0, 1.0] as defense-in-depth.
@@ -123,7 +129,7 @@ class LayerStack:
             None or contains `device_class`.
         """
         for layer in self.layers:
-            if not layer.enabled:
+            if not layer.enabled or layer.disabled:
                 continue
             classes = getattr(layer.effect, "DEVICE_CLASSES", None)
             if classes is None or device_class in classes:
@@ -163,6 +169,13 @@ def blend(
     per-tick allocations occur. When no active layer remains the canvas is
     zeroed.
 
+    Each layer's `render` call is wrapped in a try/except. An exception is
+    forwarded to `plugins.record_render_failure(layer.effect_name, exc)`; on
+    the third consecutive failure the layer's `disabled` flag is set and
+    `plugins.write_status_file()` flushes the new status to disk. A faulting
+    layer is skipped for this tick (its `scratch` buffer is not blended) so
+    other layers continue rendering normally.
+
     Args:
         canvas: Destination buffer of shape (rows, cols, 3), float32.
         stack: The handle's LayerStack.
@@ -175,7 +188,13 @@ def blend(
     """
     drew = False
     for layer in stack.active(device_class):
-        layer.effect.render(dt, layer.scratch)
+        try:
+            layer.effect.render(dt, layer.scratch)
+        except Exception as exc:
+            if record_render_failure(layer.effect_name, exc):
+                layer.disabled = True
+                write_status_file()
+            continue
         if not drew:
             if layer.opacity >= 1.0:
                 np.copyto(canvas, layer.scratch)
