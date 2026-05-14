@@ -8,6 +8,9 @@ license = "MIT"
 # They must be installed via your distro's package manager before using this tool.
 dependencies = ["numpy"]
 
+[project.optional-dependencies]
+x11 = ["python-xlib>=0.33"]
+
 [dependency-groups]
 dev = ["ruff", "ty"]
 
