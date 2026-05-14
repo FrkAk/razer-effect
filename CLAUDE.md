@@ -39,7 +39,7 @@ No test suite exists yet.
 
 ## Key Constraints
 
-- System dependencies not on PyPI: `python3-openrazer`, `gi` (GTK4/libadwaita) — must be installed via distro package manager
+- System dependencies not on PyPI: `python3-openrazer`, `gi` (GTK4/libadwaita), `python3-dbus` (UPower battery polling) — must be installed via distro package manager
 - Render loop is performance-sensitive: numpy operations are in-place/zero-allocation where possible
 - No new dependencies without discussion
 

@@ -4,8 +4,9 @@ version = "0.1.0"
 description = "Per-key random RGB effects with smooth fades for Razer keyboards via OpenRazer"
 requires-python = ">=3.10"
 license = "MIT"
-# Note: python3-openrazer and gi (GTK4) are system packages (not on PyPI).
-# They must be installed via your distro's package manager before using this tool.
+# Note: python3-openrazer, gi (GTK4), and python3-dbus (UPower battery polling)
+# are system packages (not on PyPI). They must be installed via your distro's
+# package manager before using this tool.
 dependencies = ["numpy"]
 
 [dependency-groups]
